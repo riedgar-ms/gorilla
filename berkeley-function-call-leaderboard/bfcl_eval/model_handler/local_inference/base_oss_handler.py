@@ -385,19 +385,28 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         # https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md#special-tokens
 
         tool_call_list = [self.convert_function_to_schema(f) for f in function]
-        tool_call_schema = {
+        tool_call_schema_phi = {
             "type": "array",
             "items": {"anyOf": tool_call_list},
             "minItems": 1,
         }
+        tool_call_schema_qwen = {
+            "anyOf": tool_call_list
+        }
         
-        sample_grammar = """
+        sample_grammar_phi = """
 start: (TEXT | fun_call) <|end|>
 fun_call: <|tool_call|> json_body <|/tool_call|>
 TEXT: /[^{](.|\\n)*/
-json_body: %json """ + json.dumps(tool_call_schema)
+json_body: %json """ + json.dumps(tool_call_schema_phi)
 
-        extra_body["guided_grammar"] = sample_grammar
+        sample_grammar_qwen = """
+start: (TEXT | fun_call+) <|im_end|>
+fun_call: <tool_call> "\\n" json_body "\\n" </tool_call> "\\n"
+TEXT: /[^{](.|\\n)*/
+json_body: %json """ + json.dumps(tool_call_schema_qwen)
+
+        extra_body["guided_grammar"] = sample_grammar_qwen
 
         start_time = time.time()
         if len(extra_body) > 0:
@@ -419,9 +428,9 @@ json_body: %json """ + json.dumps(tool_call_schema)
             )
         end_time = time.time()
 
-        # print(f"Prompt sent: {formatted_prompt}")
+        print(f"Prompt sent: {formatted_prompt}")
         # print(f"sample_grammar: {sample_grammar}")
-        # print(f"API response: {api_response.choices[0].text}")
+        print(f"API response: {api_response.choices[0].text}")
         return api_response, end_time - start_time
 
     @override
