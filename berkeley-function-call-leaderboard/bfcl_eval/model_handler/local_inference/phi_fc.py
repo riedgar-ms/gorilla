@@ -66,6 +66,7 @@ class PhiFCHandler(OSSHandler):
             # microsoft documentation has no guidance on indentation
             tool_contents += json.dumps(func)
             tool_contents += "\n"
+        tool_contents = json.dumps(function).strip()
 
         # format the rest of the prompt
         formatted_prompt = (
