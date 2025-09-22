@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import threading
@@ -140,6 +141,8 @@ class OSSHandler(BaseHandler, EnforceOverrides):
                             "--gpu-memory-utilization",
                             str(gpu_memory_utilization),
                             "--trust-remote-code",
+                            "--guided-decoding-backend",
+                            "guidance"
                         ],
                         stdout=subprocess.PIPE,  # Capture stdout
                         stderr=subprocess.PIPE,  # Capture stderr
@@ -221,7 +224,7 @@ class OSSHandler(BaseHandler, EnforceOverrides):
                     time.sleep(1)
 
             # Signal threads to stop reading output
-            self._stop_event.set()
+            # self._stop_event.set()
 
         except Exception as e:
             # Clean-up everything we already started, then re-raise
@@ -269,6 +272,87 @@ class OSSHandler(BaseHandler, EnforceOverrides):
             "OSS Models should implement their own prompt formatting."
         )
 
+    def convert_param_type_to_json_schema(self, param_type: str) -> str:
+        """Converts the parameter type to a JSON schema type."""
+        assert isinstance(param_type, str)
+        type_mapping = {
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+        }
+        if param_type not in type_mapping:
+            return param_type
+        return type_mapping[param_type]
+    
+    def convert_argument_to_json_schema(self, argument_def:dict) -> dict:
+        result = {}
+
+        if argument_def["type"] == "list" or argument_def["type"] == "tuple":
+            result["type"] = "array"
+            if "items" in argument_def:
+                result["items"] = self.convert_argument_to_json_schema(argument_def["items"])
+            else:
+                result["items"] = {}
+        elif argument_def["type"] == "dict":
+            result["type"] = "object"
+            if "properties" in argument_def:
+                result["properties"] = {}
+                for param, param_def in argument_def["properties"].items():
+                    result["properties"][param] = self.convert_argument_to_json_schema(param_def)
+                result["required"] = argument_def["required"] if "required" in argument_def else []
+                result["additionalProperties"] = False
+            else:
+                result["properties"] = {}
+        elif argument_def["type"] == "any":
+            # Nothing to do, any type is allowed so schema is empty
+            pass
+        else:
+            result["type"] = self.convert_param_type_to_json_schema(argument_def["type"])
+            if "enum" in argument_def:
+                result["enum"] = argument_def["enum"]
+            if "description" in argument_def:
+                result["description"] = argument_def["description"]
+            if "default" in argument_def:
+                result["default"] = argument_def["default"]
+            if "minimum" in argument_def:
+                result["minimum"] = argument_def["minimum"]
+            if "maximum" in argument_def:
+                result["maximum"] = argument_def["maximum"]
+            if "minLength" in argument_def:
+                result["minLength"] = argument_def["minLength"]
+            if "maxLength" in argument_def:
+                result["maxLength"] = argument_def["maxLength"]
+            if "pattern" in argument_def:
+                result["pattern"] = argument_def["pattern"]
+            if "format" in argument_def:
+                result["format"] = argument_def["format"]
+
+        return result
+
+
+    def convert_function_to_schema(self, function_def:dict) -> dict:
+        """Converts the function definition into the schema for its invocation."""
+        result = {}
+        result["type"] = "object"
+
+        arguments = {}
+        arguments["type"] = "object"
+        arguments["properties"] = {}
+        arguments["required"] = function_def["parameters"]["required"] if "required" in function_def["parameters"] else []
+        arguments["additionalProperties"] = False
+        for param, param_def in function_def["parameters"]["properties"].items():
+            arguments["properties"][param] = self.convert_argument_to_json_schema(param_def)
+
+        result["properties"] = {
+            "name": {"const": function_def["name"]},
+            "arguments": arguments,
+        }
+
+        result["required"] = ["name", "arguments"]
+        result["additionalProperties"] = False
+        return result
+
+
     @override
     def _query_prompting(self, inference_data: dict):
         # We use the OpenAI Completions API
@@ -297,6 +381,33 @@ class OSSHandler(BaseHandler, EnforceOverrides):
         if hasattr(self, "skip_special_tokens"):
             extra_body["skip_special_tokens"] = self.skip_special_tokens
 
+        # See
+        # https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md#special-tokens
+
+        tool_call_list = [self.convert_function_to_schema(f) for f in function]
+        tool_call_schema_phi = {
+            "type": "array",
+            "items": {"anyOf": tool_call_list},
+            "minItems": 1,
+        }
+        tool_call_schema_qwen = {
+            "anyOf": tool_call_list
+        }
+        
+        sample_grammar_phi = """
+start: (TEXT | fun_call) <|end|>
+fun_call: <|tool_call|> json_body <|/tool_call|>
+TEXT: /[^{](.|\\n)*/
+json_body: %json """ + json.dumps(tool_call_schema_phi)
+
+        sample_grammar_qwen = """
+start: (TEXT | fun_call+) <|im_end|>
+fun_call: <tool_call> "\\n" json_body "\\n" </tool_call> "\\n"
+TEXT: /[^{](.|\\n)*/
+json_body: %json """ + json.dumps(tool_call_schema_qwen)
+
+        extra_body["guided_grammar"] = sample_grammar_qwen
+
         start_time = time.time()
         if len(extra_body) > 0:
             api_response = self.client.completions.create(
@@ -317,6 +428,9 @@ class OSSHandler(BaseHandler, EnforceOverrides):
             )
         end_time = time.time()
 
+        print(f"Prompt sent: {formatted_prompt}")
+        # print(f"sample_grammar: {sample_grammar}")
+        print(f"API response: {api_response.choices[0].text}")
         return api_response, end_time - start_time
 
     @override
